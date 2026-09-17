@@ -175,19 +175,22 @@ pub enum SettingsSection {
     Appearance,
     Files,
     Notifications,
+    /// Default sandbox level for new chats.
+    Security,
     Shortcuts,
     Archived,
     Sync,
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 9] = [
+    pub const ALL: [SettingsSection; 10] = [
         SettingsSection::Devices,
         SettingsSection::Harnesses,
         SettingsSection::Agents,
         SettingsSection::Appearance,
         SettingsSection::Files,
         SettingsSection::Notifications,
+        SettingsSection::Security,
         SettingsSection::Shortcuts,
         SettingsSection::Archived,
         SettingsSection::Sync,
@@ -203,10 +206,30 @@ impl SettingsSection {
             SettingsSection::Appearance => "Appearance",
             SettingsSection::Files => "Files",
             SettingsSection::Notifications => "Notifications",
+            SettingsSection::Security => "Security",
             SettingsSection::Shortcuts => "Shortcuts",
             SettingsSection::Archived => "Archived sessions",
             SettingsSection::Sync => "Sync",
         }
+    }
+}
+
+/// Parse `KOMET_OPEN_ROUTE` into the startup route. The flag is true for
+/// `new`, which keeps the new-chat screen open instead of selecting a chat.
+fn boot_route(value: Option<&str>) -> (Route, bool) {
+    match value {
+        Some("settings") | Some("settings/devices") => {
+            (Route::Settings(SettingsSection::Devices), false)
+        }
+        Some("settings/agents") => (Route::Settings(SettingsSection::Agents), false),
+        Some("settings/harnesses") => (Route::Settings(SettingsSection::Harnesses), false),
+        Some("settings/appearance") => (Route::Settings(SettingsSection::Appearance), false),
+        Some("settings/notifications") => (Route::Settings(SettingsSection::Notifications), false),
+        Some("settings/security") => (Route::Settings(SettingsSection::Security), false),
+        Some("settings/shortcuts") => (Route::Settings(SettingsSection::Shortcuts), false),
+        Some("settings/archived") => (Route::Settings(SettingsSection::Archived), false),
+        Some("new") => (Route::Chat, true),
+        _ => (Route::Chat, false),
     }
 }
 
@@ -852,11 +875,13 @@ pub struct Shell {
     appearance_page: Option<Entity<AppearancePage>>,
     files_settings_page: Option<Entity<FilesSettingsPage>>,
     notifications_page: Option<Entity<NotificationsPage>>,
+    security_page: Option<Entity<crate::settings::security::SecurityPage>>,
     shortcuts_page: Option<Entity<ShortcutsPage>>,
     accounts_page: Option<Entity<AccountsPage>>,
     harnesses_page: Option<Entity<HarnessesPage>>,
     shortcuts_sub: Option<Subscription>,
     notifications_sub: Option<Subscription>,
+    security_sub: Option<Subscription>,
     /// Session-row context menu: (chat id, window position).
     chat_menu: popover::Popup<(String, Point<Pixels>)>,
     rename_dialog: Option<RenameChatDialog>,
@@ -919,6 +944,9 @@ pub struct Shell {
     boot: EngineBootConfig,
     data_dir: PathBuf,
     settings: UiSettings,
+    /// Saved security settings (`security-defaults.json`): the default sandbox
+    /// level for new chats.
+    security_defaults: crate::settings::security::SecurityDefaults,
     /// Session-scoped panel open flags (terminal / changes per chat; §1.10-1.11
     /// parity — heights stay in [`UiSettings`]).
     panels: SessionPanels,
@@ -1032,26 +1060,18 @@ impl Shell {
         let settings = UiSettings::load(&data_dir);
         // Bind the customizable shortcuts from the persisted keymap.
         apply_keymap(cx, &settings.keymap);
+        // Load the default sandbox level for new chats.
+        let security_defaults = crate::settings::security::SecurityDefaults::load(&data_dir);
+        state.update(cx, |s, _| {
+            crate::settings::security::seed_new_chat_access(s, &security_defaults)
+        });
         // Dev/testing knob: `KOMET_OPEN_ROUTE=settings[/<section>]` boots
         // straight into a settings section — these pages have no deep link and
         // synthetic input can't reach them on headless compositors.
-        let route = match std::env::var("KOMET_OPEN_ROUTE").ok().as_deref() {
-            Some("settings") | Some("settings/devices") => {
-                Route::Settings(SettingsSection::Devices)
-            }
-            Some("settings/agents") => Route::Settings(SettingsSection::Agents),
-            Some("settings/harnesses") => Route::Settings(SettingsSection::Harnesses),
-            Some("settings/appearance") => Route::Settings(SettingsSection::Appearance),
-            Some("settings/notifications") => Route::Settings(SettingsSection::Notifications),
-            Some("settings/shortcuts") => Route::Settings(SettingsSection::Shortcuts),
-            Some("settings/archived") => Route::Settings(SettingsSection::Archived),
-            // `new` pins the new-chat canvas (suppresses boot auto-select).
-            Some("new") => {
-                state.update(cx, |s, _| s.auto_selected = true);
-                Route::Chat
-            }
-            _ => Route::Chat,
-        };
+        let (route, pin_new_chat) = boot_route(std::env::var("KOMET_OPEN_ROUTE").ok().as_deref());
+        if pin_new_chat {
+            state.update(cx, |s, _| s.auto_selected = true);
+        }
         // More capture knobs of the same kind: `KOMET_OPEN_DIALOG=rename|delete`
         // opens that dialog for the first chat once chats land; `=model` pops
         // the combined harness/model menu once the shell is Ready;
@@ -1106,11 +1126,13 @@ impl Shell {
             appearance_page: None,
             files_settings_page: None,
             notifications_page: None,
+            security_page: None,
             shortcuts_page: None,
             accounts_page: None,
             harnesses_page: None,
             shortcuts_sub: None,
             notifications_sub: None,
+            security_sub: None,
             chat_menu: popover::Popup::default(),
             rename_dialog: None,
             delete_confirm: None,
@@ -1147,6 +1169,7 @@ impl Shell {
             boot,
             data_dir,
             settings,
+            security_defaults,
             panels: SessionPanels::default(),
             active_chat: String::new(),
             sidebar_prev_order: Vec::new(),
@@ -2485,6 +2508,49 @@ impl Shell {
                     None => Empty.into_any_element(),
                 }
             }
+            SettingsSection::Security => {
+                if self.security_page.is_none() {
+                    let page = cx.new(|cx| {
+                        crate::settings::security::SecurityPage::new(
+                            self.security_defaults.default_access,
+                            cx,
+                        )
+                    });
+                    // Save the new default and apply it to new chats (see
+                    // `apply_security_pick`). Changes are rare, so the file is
+                    // written synchronously, and a failed save is logged.
+                    self.security_sub = Some(cx.subscribe(
+                        &page,
+                        |this: &mut Shell,
+                         _,
+                         event: &crate::settings::security::SecurityEvent,
+                         cx| {
+                            let crate::settings::security::SecurityEvent::Changed {
+                                default_access,
+                            } = *event;
+                            let dir = this.data_dir.clone();
+                            let mut defaults = this.security_defaults;
+                            this.state.update(cx, |s, _| {
+                                if let Err(err) = crate::settings::security::apply_security_pick(
+                                    &mut defaults,
+                                    s,
+                                    &dir,
+                                    default_access,
+                                ) {
+                                    tracing::warn!(error = %err, "security-defaults save failed");
+                                }
+                            });
+                            this.security_defaults = defaults;
+                            cx.notify();
+                        },
+                    ));
+                    self.security_page = Some(page);
+                }
+                match &self.security_page {
+                    Some(page) => page.clone().into_any_element(),
+                    None => Empty.into_any_element(),
+                }
+            }
             SettingsSection::Shortcuts => {
                 if self.shortcuts_page.is_none() {
                     let state = self.state.clone();
@@ -3486,6 +3552,7 @@ impl Shell {
             SettingsSection::Appearance => icons::TUNING,
             SettingsSection::Files => icons::FOLDER_WITH_FILES,
             SettingsSection::Notifications => icons::BELL,
+            SettingsSection::Security => icons::DANGER_TRIANGLE,
             SettingsSection::Shortcuts => icons::KEYBOARD,
             SettingsSection::Archived => icons::ARCHIVE_MINIMALISTIC,
             SettingsSection::Sync => icons::GLOBAL,
@@ -7144,6 +7211,32 @@ impl Render for Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn boot_route_parses_settings_sections() {
+        assert_eq!(
+            boot_route(Some("settings/security")),
+            (Route::Settings(SettingsSection::Security), false)
+        );
+        assert_eq!(
+            boot_route(Some("settings")),
+            (Route::Settings(SettingsSection::Devices), false)
+        );
+        assert_eq!(
+            boot_route(Some("settings/notifications")),
+            (Route::Settings(SettingsSection::Notifications), false)
+        );
+        assert_eq!(boot_route(None), (Route::Chat, false));
+        assert_eq!(boot_route(Some("")), (Route::Chat, false));
+        // `new` keeps the new-chat screen open instead of selecting a chat.
+        assert_eq!(boot_route(Some("new")), (Route::Chat, true));
+    }
+
+    #[test]
+    fn security_section_is_discoverable_in_settings_nav() {
+        assert!(SettingsSection::ALL.contains(&SettingsSection::Security));
+        assert_eq!(SettingsSection::Security.label(), "Security");
+    }
 
     #[tokio::test]
     async fn remote_shutdown_waits_for_ipc_release() {

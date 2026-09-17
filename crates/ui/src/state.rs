@@ -632,7 +632,12 @@ pub struct AppState {
     /// bootstrap so child views can persist small preference files.
     pub data_dir: Option<PathBuf>,
     pub workspace_state: Option<komet_proto::WorkspaceState>,
+    /// The sandbox level the next message is sent with. It follows the open
+    /// chat (see [`access_for_selection`]) and is updated by
+    /// [`AppState::sync_access_mode`]; it is not the default for new chats.
     pub access_mode: komet_proto::SandboxLevel,
+    /// The level new chats start at, from the Security settings.
+    pub new_chat_access: komet_proto::SandboxLevel,
     engine: Option<EngineHandle>,
     boot_config: Option<EngineBootConfig>,
     watch_tasks: Vec<Task<()>>,
@@ -671,6 +676,7 @@ impl AppState {
             data_dir: None,
             workspace_state: None,
             access_mode: komet_proto::SandboxLevel::WorkspaceWrite,
+            new_chat_access: komet_proto::SandboxLevel::WorkspaceWrite,
             engine: None,
             boot_config: None,
             watch_tasks: Vec::new(),
@@ -774,6 +780,18 @@ impl AppState {
             self.transcript.clear();
             self.transcript_task = None;
         }
+        // The update may change the open chat's level from another device, or
+        // remove the open chat, so recompute the level.
+        self.sync_access_mode();
+    }
+
+    /// Recompute [`AppState::access_mode`] from the current selection.
+    pub fn sync_access_mode(&mut self) {
+        self.access_mode = access_for_selection(
+            &self.chats,
+            self.selected_chat.as_deref(),
+            self.new_chat_access,
+        );
     }
 
     pub fn apply_sessions(&mut self, sessions: Vec<Session>) {
@@ -816,6 +834,7 @@ impl AppState {
         if let Some(chat) = self.chats.iter_mut().find(|c| c.id == chat_id) {
             chat.config = Some(config);
         }
+        self.sync_access_mode();
     }
 
     pub fn apply_devices(&mut self, mut devices: Vec<Device>) {
@@ -1258,6 +1277,7 @@ impl AppState {
         self.selected_device = None;
         self.selected_chat = None;
         self.auto_selected = false;
+        self.sync_access_mode();
         self.chats_synced = false;
         self.spaces_synced = false;
         self.transcript.clear();
@@ -1428,6 +1448,8 @@ impl AppState {
         }
         self.selected_chat = chat_id.clone();
         self.auto_selected = true;
+        // Each chat uses its own level; the new-chat screen uses the default.
+        self.sync_access_mode();
         self.transcript.clear();
         self.transcript_task = None;
         if let Some(id) = chat_id.as_deref() {
@@ -1554,6 +1576,22 @@ fn spawn_deferred_engine_watch(
         })
         .ok();
     }))
+}
+
+/// The sandbox level for the `selected` chat: its saved level
+/// (`ChatConfig.sandbox`, synced across devices). Returns `default` for the
+/// new-chat screen, a chat without a saved configuration, or a chat that is
+/// not loaded yet. Changing the default therefore never raises the level of an
+/// existing chat.
+pub fn access_for_selection(
+    chats: &[Chat],
+    selected: Option<&str>,
+    default: komet_proto::SandboxLevel,
+) -> komet_proto::SandboxLevel {
+    selected
+        .and_then(|id| chats.iter().find(|c| c.id == id))
+        .and_then(|chat| chat.config.as_ref())
+        .map_or(default, |config| config.sandbox)
 }
 
 fn is_connection_error(err: &RpcError) -> bool {
@@ -2668,6 +2706,68 @@ mod tests {
         state.selected_chat = Some("b".into());
         state.apply_chats(vec![chat("b", 1, None), chat("c", 2, None)]);
         assert_eq!(state.selected_chat.as_deref(), Some("b"));
+    }
+
+    fn chat_at(id: &str, sandbox: komet_proto::SandboxLevel) -> Chat {
+        let mut row = chat(id, 0, None);
+        row.config = Some(komet_proto::ChatConfig {
+            harness: HarnessId::ClaudeCode,
+            model: None,
+            reasoning: None,
+            model_options: serde_json::Map::new(),
+            sandbox,
+            mcp_server_ids: Vec::new(),
+        });
+        row
+    }
+
+    // Scenario 4: an existing chat uses its own level, not the default.
+    #[test]
+    fn access_for_selection_prefers_the_chats_own_level() {
+        use komet_proto::SandboxLevel::*;
+        let chats = vec![chat_at("ro", ReadOnly), chat("legacy", 1, None)];
+        // New-chat screen: the default.
+        assert_eq!(
+            access_for_selection(&chats, None, DangerFullAccess),
+            DangerFullAccess
+        );
+        // Existing chat with a saved level: its own level.
+        assert_eq!(
+            access_for_selection(&chats, Some("ro"), DangerFullAccess),
+            ReadOnly
+        );
+        // Chat without a saved configuration: the default.
+        assert_eq!(
+            access_for_selection(&chats, Some("legacy"), ReadOnly),
+            ReadOnly
+        );
+        // Chat not loaded yet: the default.
+        assert_eq!(
+            access_for_selection(&chats, Some("gone"), ReadOnly),
+            ReadOnly
+        );
+    }
+
+    #[test]
+    fn access_mode_follows_selection_and_remote_level_changes() {
+        use komet_proto::SandboxLevel::*;
+        let mut state = AppState::new();
+        state.new_chat_access = DangerFullAccess;
+        state.apply_chats(vec![chat_at("a", ReadOnly)]);
+        // No chat open: the default.
+        assert_eq!(state.access_mode, DangerFullAccess);
+        state.selected_chat = Some("a".into());
+        state.sync_access_mode();
+        assert_eq!(state.access_mode, ReadOnly);
+        // Another device changes the chat's level: the new level applies.
+        state.apply_chats(vec![chat_at("a", WorkspaceWrite)]);
+        assert_eq!(state.access_mode, WorkspaceWrite);
+        // A local change to the open chat's configuration applies too.
+        state.apply_chat_config("a", chat_at("a", ReadOnly).config.unwrap());
+        assert_eq!(state.access_mode, ReadOnly);
+        // The open chat is deleted on another device: back to the default.
+        state.apply_chats(Vec::new());
+        assert_eq!(state.access_mode, DangerFullAccess);
     }
 
     #[test]
