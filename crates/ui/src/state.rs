@@ -638,6 +638,9 @@ pub struct AppState {
     pub access_mode: komet_proto::SandboxLevel,
     /// The level new chats start at, from the Security settings.
     pub new_chat_access: komet_proto::SandboxLevel,
+    /// Levels picked for existing chats whose configuration cannot be saved
+    /// yet (harness unknown). Kept until the chat has a saved level.
+    pub chosen_access: HashMap<String, komet_proto::SandboxLevel>,
     engine: Option<EngineHandle>,
     boot_config: Option<EngineBootConfig>,
     watch_tasks: Vec<Task<()>>,
@@ -677,6 +680,7 @@ impl AppState {
             workspace_state: None,
             access_mode: komet_proto::SandboxLevel::WorkspaceWrite,
             new_chat_access: komet_proto::SandboxLevel::WorkspaceWrite,
+            chosen_access: HashMap::new(),
             engine: None,
             boot_config: None,
             watch_tasks: Vec::new(),
@@ -787,11 +791,27 @@ impl AppState {
 
     /// Recompute [`AppState::access_mode`] from the current selection.
     pub fn sync_access_mode(&mut self) {
+        let chats = &self.chats;
+        // A pending choice is only needed until the chat has a saved level.
+        self.chosen_access.retain(|id, _| {
+            chats
+                .iter()
+                .any(|chat| &chat.id == id && chat.config.is_none())
+        });
         self.access_mode = access_for_selection(
             &self.chats,
             self.selected_chat.as_deref(),
             self.new_chat_access,
+            &self.chosen_access,
         );
+    }
+
+    /// Record the level picked for `chat_id` and apply it. Needed when the
+    /// chat's configuration cannot be saved yet; once the chat has a saved
+    /// level (the engine saves it with the first run) the saved level applies.
+    pub fn choose_chat_access(&mut self, chat_id: &str, level: komet_proto::SandboxLevel) {
+        self.chosen_access.insert(chat_id.to_string(), level);
+        self.sync_access_mode();
     }
 
     pub fn apply_sessions(&mut self, sessions: Vec<Session>) {
@@ -1580,14 +1600,15 @@ fn spawn_deferred_engine_watch(
 
 /// The sandbox level for the `selected` chat. The new-chat screen (no
 /// selection) uses `default`. An existing chat uses its saved level
-/// (`ChatConfig.sandbox`, synced across devices), or `WorkspaceWrite`, the level
-/// such chats always used, when it has no saved configuration or its row has
-/// not loaded yet. Changing the default therefore never raises the level of an
-/// existing chat.
+/// (`ChatConfig.sandbox`, synced across devices); without one, the level picked
+/// for it in `chosen` while it could not be saved; otherwise `WorkspaceWrite`,
+/// the level such chats always used. Changing the default therefore never
+/// raises the level of an existing chat.
 pub fn access_for_selection(
     chats: &[Chat],
     selected: Option<&str>,
     default: komet_proto::SandboxLevel,
+    chosen: &HashMap<String, komet_proto::SandboxLevel>,
 ) -> komet_proto::SandboxLevel {
     let Some(id) = selected else {
         return default;
@@ -1596,9 +1617,9 @@ pub fn access_for_selection(
         .iter()
         .find(|c| c.id == id)
         .and_then(|chat| chat.config.as_ref())
-        .map_or(komet_proto::SandboxLevel::WorkspaceWrite, |config| {
-            config.sandbox
-        })
+        .map(|config| config.sandbox)
+        .or_else(|| chosen.get(id).copied())
+        .unwrap_or(komet_proto::SandboxLevel::WorkspaceWrite)
 }
 
 fn is_connection_error(err: &RpcError) -> bool {
@@ -2733,28 +2754,71 @@ mod tests {
     fn access_for_selection_prefers_the_chats_own_level() {
         use komet_proto::SandboxLevel::*;
         let chats = vec![chat_at("ro", ReadOnly), chat("legacy", 1, None)];
+        let none = HashMap::new();
         // New-chat screen: the default.
         assert_eq!(
-            access_for_selection(&chats, None, DangerFullAccess),
+            access_for_selection(&chats, None, DangerFullAccess, &none),
             DangerFullAccess
         );
-        // Existing chat with a saved level: its own level.
+        // Existing chat with a saved level: its own level, even over a level
+        // chosen before it could be saved.
+        let chosen = HashMap::from([("ro".to_string(), DangerFullAccess)]);
         assert_eq!(
-            access_for_selection(&chats, Some("ro"), DangerFullAccess),
+            access_for_selection(&chats, Some("ro"), DangerFullAccess, &chosen),
             ReadOnly
         );
         // An existing chat without a saved configuration keeps the level such
         // chats always used, so a Full access default never reaches it.
         assert_eq!(
-            access_for_selection(&chats, Some("legacy"), DangerFullAccess),
+            access_for_selection(&chats, Some("legacy"), DangerFullAccess, &none),
             WorkspaceWrite
         );
         // Same for a selected chat whose row has not loaded yet; the level is
         // recomputed when the row arrives.
         assert_eq!(
-            access_for_selection(&chats, Some("gone"), DangerFullAccess),
+            access_for_selection(&chats, Some("gone"), DangerFullAccess, &none),
             WorkspaceWrite
         );
+    }
+
+    // A level picked for a chat whose configuration cannot be saved yet (harness
+    // unknown) must survive later chat syncs instead of falling back to
+    // WorkspaceWrite, which would raise a Read only pick.
+    #[test]
+    fn chosen_level_survives_until_the_chat_has_a_saved_level() {
+        use komet_proto::SandboxLevel::*;
+        let mut state = AppState::new();
+        state.new_chat_access = DangerFullAccess;
+        state.apply_chats(vec![chat("legacy", 0, None)]);
+        state.selected_chat = Some("legacy".into());
+        state.sync_access_mode();
+        assert_eq!(state.access_mode, WorkspaceWrite);
+
+        state.choose_chat_access("legacy", ReadOnly);
+        assert_eq!(state.access_mode, ReadOnly);
+        // A sync where the row still has no saved configuration keeps the pick.
+        state.apply_chats(vec![chat("legacy", 0, None)]);
+        assert_eq!(state.access_mode, ReadOnly);
+
+        // The engine saves the configuration with the first run: the saved
+        // level applies and the pending choice is dropped.
+        state.apply_chats(vec![chat_at("legacy", ReadOnly)]);
+        assert_eq!(state.access_mode, ReadOnly);
+        assert!(!state.chosen_access.contains_key("legacy"));
+    }
+
+    #[test]
+    fn chosen_level_is_dropped_when_the_chat_is_deleted() {
+        use komet_proto::SandboxLevel::*;
+        let mut state = AppState::new();
+        state.new_chat_access = DangerFullAccess;
+        state.apply_chats(vec![chat("legacy", 0, None)]);
+        state.selected_chat = Some("legacy".into());
+        state.choose_chat_access("legacy", ReadOnly);
+
+        state.apply_chats(Vec::new());
+        assert!(state.chosen_access.is_empty());
+        assert_eq!(state.access_mode, DangerFullAccess);
     }
 
     #[test]

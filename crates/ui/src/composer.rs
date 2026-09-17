@@ -3639,13 +3639,17 @@ impl Composer {
     /// screen it applies to the draft only and leaves the Security default as is.
     fn cycle_access_mode(&mut self, cx: &mut Context<Self>) {
         let next = next_access(self.state.read(cx).access_mode);
-        if self.state.read(cx).selected_chat.is_some() {
-            self.pickers
-                .update(cx, |pickers, cx| pickers.set_chat_sandbox(next, cx));
+        match self.state.read(cx).selected_chat.clone() {
+            Some(chat_id) => {
+                self.pickers
+                    .update(cx, |pickers, cx| pickers.set_chat_sandbox(next, cx));
+                // A chat without a saved configuration (unknown harness) cannot
+                // be written yet; remember the pick so a later sync keeps it.
+                self.state
+                    .update(cx, |state, _| state.choose_chat_access(&chat_id, next));
+            }
+            None => self.state.update(cx, |state, _| state.access_mode = next),
         }
-        // Also set it directly: a chat without a saved configuration (unknown
-        // harness) cannot be written, but its next message still uses this level.
-        self.state.update(cx, |state, _| state.access_mode = next);
         cx.notify();
     }
 
