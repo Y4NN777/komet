@@ -1578,9 +1578,10 @@ fn spawn_deferred_engine_watch(
     }))
 }
 
-/// The sandbox level for the `selected` chat: its saved level
-/// (`ChatConfig.sandbox`, synced across devices). Returns `default` for the
-/// new-chat screen, a chat without a saved configuration, or a chat that is
+/// The sandbox level for the `selected` chat. The new-chat screen (no
+/// selection) uses `default`. An existing chat uses its saved level
+/// (`ChatConfig.sandbox`, synced across devices), or `WorkspaceWrite`, the level
+/// such chats always used, when it has no saved configuration or its row has
 /// not loaded yet. Changing the default therefore never raises the level of an
 /// existing chat.
 pub fn access_for_selection(
@@ -1588,10 +1589,16 @@ pub fn access_for_selection(
     selected: Option<&str>,
     default: komet_proto::SandboxLevel,
 ) -> komet_proto::SandboxLevel {
-    selected
-        .and_then(|id| chats.iter().find(|c| c.id == id))
+    let Some(id) = selected else {
+        return default;
+    };
+    chats
+        .iter()
+        .find(|c| c.id == id)
         .and_then(|chat| chat.config.as_ref())
-        .map_or(default, |config| config.sandbox)
+        .map_or(komet_proto::SandboxLevel::WorkspaceWrite, |config| {
+            config.sandbox
+        })
 }
 
 fn is_connection_error(err: &RpcError) -> bool {
@@ -2736,15 +2743,17 @@ mod tests {
             access_for_selection(&chats, Some("ro"), DangerFullAccess),
             ReadOnly
         );
-        // Chat without a saved configuration: the default.
+        // An existing chat without a saved configuration keeps the level such
+        // chats always used, so a Full access default never reaches it.
         assert_eq!(
-            access_for_selection(&chats, Some("legacy"), ReadOnly),
-            ReadOnly
+            access_for_selection(&chats, Some("legacy"), DangerFullAccess),
+            WorkspaceWrite
         );
-        // Chat not loaded yet: the default.
+        // Same for a selected chat whose row has not loaded yet; the level is
+        // recomputed when the row arrives.
         assert_eq!(
-            access_for_selection(&chats, Some("gone"), ReadOnly),
-            ReadOnly
+            access_for_selection(&chats, Some("gone"), DangerFullAccess),
+            WorkspaceWrite
         );
     }
 
